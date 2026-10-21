@@ -2,6 +2,9 @@ package main
 
 import (
 	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/uudashr/gocognit"
@@ -68,5 +71,71 @@ func TestFilterStatFiles(t *testing.T) {
 	file := filterStatFiles(stats, "/p/a.go", true)
 	if len(file) != 1 || file[0].FuncName != "A" {
 		t.Fatalf("file filter = %v, want only A", file)
+	}
+}
+
+func TestIgnoreUnparseableFilesFullPath(t *testing.T) {
+	tmp := t.TempDir()
+
+	validGo := []byte("package p\n\nfunc Ok(x bool) {\n\tif x {\n\t}\n}\n")
+	if err := os.WriteFile(filepath.Join(tmp, "ok.go"), validGo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	testdataDir := filepath.Join(tmp, "testdata")
+	if err := os.MkdirAll(testdataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	badFile := filepath.Join(testdataDir, "broken.go")
+	if err := os.WriteFile(badFile, []byte("package p\nfunc broken( {\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without -ignore, analyzing the directory fails on the unparseable file.
+	if _, err := analyze([]string{tmp}, true, nil, false, false); err == nil {
+		t.Fatal("expected parse error without ignore regexp, got nil")
+	}
+
+	// With -ignore matching "/testdata/" against the full path, analyzing "."
+	// from inside tmp or inside tmp/testdata skips broken.go before parsing.
+	re := regexp.MustCompile(`/testdata/`)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := analyze([]string{"."}, true, re, false, false)
+	if err != nil {
+		t.Fatalf("analyze(\".\") from parent dir failed: %v", err)
+	}
+	if len(stats) != 1 || stats[0].FuncName != "Ok" {
+		t.Fatalf("got stats %v, want [Ok]", stats)
+	}
+
+	if err := os.Chdir(testdataDir); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err = analyze([]string{"."}, true, re, false, false)
+	if err != nil {
+		t.Fatalf("analyze(\".\") from testdata dir failed: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("got stats %v, want empty", stats)
+	}
+
+	stats, err = analyze([]string{"broken.go"}, true, re, false, false)
+	if err != nil {
+		t.Fatalf("analyze(\"broken.go\") from testdata dir failed: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("got stats %v, want empty", stats)
 	}
 }

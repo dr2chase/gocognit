@@ -178,17 +178,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	stats, err := analyze(args, includeTests, enableDiagnostics, exactRecursion)
+	ignoreRegexp, err := prepareRegexp(ignoreExpr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	stats, err := analyze(args, includeTests, ignoreRegexp, enableDiagnostics, exactRecursion)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	sort.Sort(byComplexity(stats))
-
-	ignoreRegexp, err := prepareRegexp(ignoreExpr)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	filteredStats := filterStats(stats, ignoreRegexp, top, over)
 
@@ -212,7 +212,7 @@ func main() {
 	}
 }
 
-func analyzePath(path string, includeTests bool, includeDiagnostic bool, exactRecursion bool) ([]gocognit.Stat, error) {
+func analyzePath(path string, includeTests bool, ignoreRegexp *regexp.Regexp, includeDiagnostic bool, exactRecursion bool) ([]gocognit.Stat, error) {
 	if exactRecursion {
 		stats, err := analyzeExactRecursionPath(path, includeTests, includeDiagnostic)
 		if err == nil {
@@ -222,25 +222,25 @@ func analyzePath(path string, includeTests bool, includeDiagnostic bool, exactRe
 		log.Printf("warning: %s: type-aware analysis failed, falling back to syntax: %v", path, err)
 
 		// The user already asked for type-aware analysis; do not suggest it again.
-		return analyzeSyntacticPath(path, includeTests, includeDiagnostic, false)
+		return analyzeSyntacticPath(path, includeTests, ignoreRegexp, includeDiagnostic, false)
 	}
 
-	return analyzeSyntacticPath(path, includeTests, includeDiagnostic, true)
+	return analyzeSyntacticPath(path, includeTests, ignoreRegexp, includeDiagnostic, true)
 }
 
-func analyzeSyntacticPath(path string, includeTests bool, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
+func analyzeSyntacticPath(path string, includeTests bool, ignoreRegexp *regexp.Regexp, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
 	if isDir(path) {
-		return analyzeDir(path, includeTests, nil, includeDiagnostic, suggestExactRecursion)
+		return analyzeDir(path, includeTests, ignoreRegexp, nil, includeDiagnostic, suggestExactRecursion)
 	}
 
-	return analyzeFile(path, nil, includeDiagnostic, suggestExactRecursion)
+	return analyzeFile(path, ignoreRegexp, nil, includeDiagnostic, suggestExactRecursion)
 }
 
-func analyze(paths []string, includeTests bool, includeDiagnostic bool, exactRecursion bool) (stats []gocognit.Stat, err error) {
+func analyze(paths []string, includeTests bool, ignoreRegexp *regexp.Regexp, includeDiagnostic bool, exactRecursion bool) (stats []gocognit.Stat, err error) {
 	var out []gocognit.Stat
 
 	for _, path := range paths {
-		stats, err := analyzePath(path, includeTests, includeDiagnostic, exactRecursion)
+		stats, err := analyzePath(path, includeTests, ignoreRegexp, includeDiagnostic, exactRecursion)
 		if err != nil {
 			return nil, err
 		}
@@ -396,7 +396,11 @@ func dedupeStats(stats []gocognit.Stat) []gocognit.Stat {
 	return out
 }
 
-func analyzeFile(fname string, stats []gocognit.Stat, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
+func analyzeFile(fname string, ignoreRegexp *regexp.Regexp, stats []gocognit.Stat, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
+	if shouldIgnore(fname, ignoreRegexp) {
+		return stats, nil
+	}
+
 	fset := token.NewFileSet()
 
 	f, err := parser.ParseFile(fset, fname, nil, parser.ParseComments)
@@ -411,7 +415,7 @@ func analyzeFile(fname string, stats []gocognit.Stat, includeDiagnostic bool, su
 	return gocognit.ComplexityStatsWithDiagnostic(f, fset, stats, includeDiagnostic), nil
 }
 
-func analyzeDir(dirname string, includeTests bool, stats []gocognit.Stat, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
+func analyzeDir(dirname string, includeTests bool, ignoreRegexp *regexp.Regexp, stats []gocognit.Stat, includeDiagnostic bool, suggestExactRecursion bool) ([]gocognit.Stat, error) {
 	byDir := make(map[string][]string)
 
 	err := filepath.Walk(dirname, func(path string, info os.FileInfo, err error) error {
@@ -428,6 +432,10 @@ func analyzeDir(dirname string, includeTests bool, stats []gocognit.Stat, includ
 		}
 
 		if !includeTests && strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		if shouldIgnore(path, ignoreRegexp) {
 			return nil
 		}
 
@@ -539,6 +547,23 @@ func prepareRegexp(expr string) (*regexp.Regexp, error) {
 	return regexp.Compile(expr)
 }
 
+func shouldIgnore(path string, ignoreRegexp *regexp.Regexp) bool {
+	if ignoreRegexp == nil {
+		return false
+	}
+
+	if ignoreRegexp.MatchString(path) {
+		return true
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+
+	return ignoreRegexp.MatchString(absPath) || ignoreRegexp.MatchString(filepath.ToSlash(absPath))
+}
+
 func filterStats(sortedStats []gocognit.Stat, ignoreRegexp *regexp.Regexp, top, over int) []gocognit.Stat {
 	var filtered []gocognit.Stat
 
@@ -552,7 +577,7 @@ func filterStats(sortedStats []gocognit.Stat, ignoreRegexp *regexp.Regexp, top, 
 			break
 		}
 
-		if ignoreRegexp != nil && ignoreRegexp.MatchString(stat.Pos.Filename) {
+		if shouldIgnore(stat.Pos.Filename, ignoreRegexp) {
 			continue
 		}
 
