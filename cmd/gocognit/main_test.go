@@ -88,7 +88,7 @@ func TestIgnoreUnparseableFilesFullPath(t *testing.T) {
 	}
 
 	badFile := filepath.Join(testdataDir, "broken.go")
-	if err := os.WriteFile(badFile, []byte("package p\nfunc broken( {\n"), 0o600); err != nil {
+	if err := os.WriteFile(badFile, []byte("not valid go\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,9 +97,18 @@ func TestIgnoreUnparseableFilesFullPath(t *testing.T) {
 		t.Fatal("expected parse error without ignore regexp, got nil")
 	}
 
-	// With -ignore matching "/testdata/" against the full path, analyzing "."
-	// from inside tmp or inside tmp/testdata skips broken.go before parsing.
+	// With -ignore matching "/testdata/" against the full path, analyzing tmp,
+	// "." from inside tmp, or "." from inside tmp/testdata skips broken.go before parsing.
 	re := regexp.MustCompile(`/testdata/`)
+
+	// Direct full-path match in shouldIgnore (path already contains /testdata/).
+	stats, err := analyze([]string{tmp}, true, re, false, false)
+	if err != nil {
+		t.Fatalf("analyze(%q) failed: %v", tmp, err)
+	}
+	if len(stats) != 1 || stats[0].FuncName != "Ok" {
+		t.Fatalf("got stats %v, want [Ok]", stats)
+	}
 
 	origWD, err := os.Getwd()
 	if err != nil {
@@ -111,7 +120,7 @@ func TestIgnoreUnparseableFilesFullPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stats, err := analyze([]string{"."}, true, re, false, false)
+	stats, err = analyze([]string{"."}, true, re, false, false)
 	if err != nil {
 		t.Fatalf("analyze(\".\") from parent dir failed: %v", err)
 	}
@@ -138,4 +147,76 @@ func TestIgnoreUnparseableFilesFullPath(t *testing.T) {
 	if len(stats) != 0 {
 		t.Fatalf("got stats %v, want empty", stats)
 	}
+
+	// Also exercise exactRecursion fallback to analyzeSyntacticPath.
+	t.Setenv("GOPACKAGESDRIVER", filepath.Join(tmp, "nonexistent-driver"))
+	stats, err = analyze([]string{"broken.go"}, true, re, false, true)
+	if err != nil {
+		t.Fatalf("analyze(\"broken.go\") with exactRecursion fallback failed: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("got stats %v, want empty", stats)
+	}
+
+	// Exercise filterStats with ignoreRegexp.
+	filtered := filterStats([]gocognit.Stat{
+		{FuncName: "Ignored", Complexity: 5, Pos: token.Position{Filename: badFile}},
+		{FuncName: "Kept", Complexity: 5, Pos: token.Position{Filename: filepath.Join(tmp, "ok.go")}},
+	}, re, -1, 0)
+	if len(filtered) != 1 || filtered[0].FuncName != "Kept" {
+		t.Fatalf("filterStats = %v, want [Kept]", filtered)
+	}
+
+	// Exercise shouldIgnore when filepath.Abs fails (inaccessible working directory).
+	inaccessibleDir := filepath.Join(tmp, "inaccessible")
+	subDir := filepath.Join(inaccessibleDir, "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(subDir); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(subDir, 0)
+	_ = os.Chmod(inaccessibleDir, 0)
+	defer func() {
+		_ = os.Chmod(inaccessibleDir, 0o755)
+		_ = os.Chmod(subDir, 0o755)
+	}()
+	if shouldIgnore("relative.go", re) {
+		t.Fatal("expected shouldIgnore to return false when filepath.Abs fails")
+	}
+}
+
+func TestMainWithIgnore(t *testing.T) {
+	tmp := t.TempDir()
+
+	validGo := []byte("package p\n\nfunc Ok(x bool) {\n\tif x {\n\t}\n}\n")
+	if err := os.WriteFile(filepath.Join(tmp, "ok.go"), validGo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	testdataDir := filepath.Join(tmp, "testdata")
+	if err := os.MkdirAll(testdataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(testdataDir, "broken.go"), []byte("package p\nfunc ( {\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origArgs := os.Args
+	origStdout := os.Stdout
+	defer func() {
+		os.Args = origArgs
+		os.Stdout = origStdout
+	}()
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+
+	os.Stdout = devNull
+	os.Args = []string{"gocognit", "-ignore", `/testdata/`, tmp}
+	main()
 }
